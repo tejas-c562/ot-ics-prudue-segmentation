@@ -1,0 +1,138 @@
+# Purdue-model segmentation lab:  IT (L4/5)  <->  DMZ (L3.5)  <->  OT (L0-L3)
+# Start:  docker compose up -d --build        Test:  ./tests/run_tests.sh
+# Every inter-zone packet MUST traverse the `firewall` container: each node sits on
+# exactly one Docker network and has a static route to the other zones via the firewall.
+
+name: purdue-lab
+
+x-node: &node
+  build: ./tools-image
+  image: ot-lab-node:latest
+  restart: unless-stopped
+  volumes:
+    - ./firewall:/opt/lab/firewall:ro
+
+services:
+  # ---------------------------------------------------------------- boundary
+  firewall:
+    <<: *node
+    container_name: firewall
+    hostname: firewall
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    environment:
+      PLC_IP: ${PLC_IP:-10.10.30.10}
+      NAT_TO_OT: ${NAT_TO_OT:-0}
+    command: ["/opt/lab/firewall/rules.sh"]
+    volumes:
+      - ./firewall:/opt/lab/firewall:ro
+      - ./captures:/captures            # tcpdump output for project 02
+    networks:
+      it_net:  { ipv4_address: 10.10.10.254 }
+      dmz_net: { ipv4_address: 10.10.20.254 }
+      ot_net:  { ipv4_address: 10.10.30.254 }
+
+  # ---------------------------------------------------------------- IT zone (L4/5)
+  it-ws:
+    <<: *node
+    container_name: it-ws
+    hostname: it-ws
+    cap_add: [NET_ADMIN]
+    environment:
+      GATEWAY: 10.10.10.254
+      ROUTES: "10.10.20.0/24 10.10.30.0/24"
+    entrypoint: ["/opt/lab/firewall/node-entrypoint.sh"]
+    command: ["sleep", "infinity"]
+    networks:
+      it_net: { ipv4_address: 10.10.10.10 }
+
+  # ---------------------------------------------------------------- DMZ (L3.5)
+  historian:
+    <<: *node
+    container_name: historian
+    hostname: historian
+    cap_add: [NET_ADMIN]
+    environment:
+      GATEWAY: 10.10.20.254
+      ROUTES: "10.10.10.0/24 10.10.30.0/24"
+      PLC_HOST: ${PLC_IP:-10.10.30.10}
+    entrypoint: ["/opt/lab/firewall/node-entrypoint.sh"]
+    command: ["python", "/opt/lab/app/historian.py"]
+    volumes:
+      - ./firewall:/opt/lab/firewall:ro
+      - ./historian:/opt/lab/app:ro
+      - ../02-ot-network-visibility-threat-detection-poc/attack_scripts:/attack:ro
+    ports:
+      - "127.0.0.1:8081:8081"          # lab-operator convenience only (outside the model)
+    networks:
+      dmz_net: { ipv4_address: 10.10.20.10 }
+
+  # ---------------------------------------------------------------- OT zone (L0-L2)
+  plc:
+    <<: *node
+    container_name: plc
+    hostname: plc
+    cap_add: [NET_ADMIN]
+    environment:
+      GATEWAY: 10.10.30.254
+      ROUTES: "10.10.10.0/24 10.10.20.0/24"
+    entrypoint: ["/opt/lab/firewall/node-entrypoint.sh"]
+    command: ["python", "/opt/lab/app/plc_sim.py"]
+    volumes:
+      - ./firewall:/opt/lab/firewall:ro
+      - ./plc-sim:/opt/lab/app:ro
+    networks:
+      ot_net: { ipv4_address: 10.10.30.10 }
+
+  hmi:
+    <<: *node
+    container_name: hmi
+    hostname: hmi
+    environment:
+      PLC_HOST: ${PLC_IP:-10.10.30.10}
+    command: ["python", "/opt/lab/app/hmi.py"]
+    volumes:
+      - ./hmi:/opt/lab/app:ro
+    networks:
+      ot_net: { ipv4_address: 10.10.30.20 }
+
+  # ------------------------------------------------------- OPTIONAL real-world nodes
+  # Run:  PLC_IP=10.10.30.11 NAT_TO_OT=1 docker compose --profile openplc up -d --scale plc=0
+  # Image names are community-maintained and may change: verify, or override via env.
+  openplc:
+    profiles: ["openplc"]
+    image: ${OPENPLC_IMAGE:-openplcproject/openplc:v3}
+    container_name: openplc
+    networks:
+      ot_net: { ipv4_address: 10.10.30.11 }
+
+  scadabr:
+    profiles: ["scadabr"]
+    image: ${SCADABR_IMAGE:-aimrasi/scadabr:latest}
+    container_name: scadabr
+    networks:
+      ot_net: { ipv4_address: 10.10.30.21 }
+
+  # ------------------------------------------------------- ATTACK / DETECTION profile
+  # A device that should NOT exist on the OT network (used by project 02).
+  rogue-ot:
+    <<: *node
+    profiles: ["attack"]
+    container_name: rogue-ot
+    hostname: rogue-ot
+    volumes:
+      - ../02-ot-network-visibility-threat-detection-poc/attack_scripts:/attack:ro
+    networks:
+      ot_net: { ipv4_address: 10.10.30.99 }
+
+networks:
+  it_net:
+    driver: bridge
+    ipam: { config: [ { subnet: 10.10.10.0/24 } ] }
+  dmz_net:
+    driver: bridge
+    ipam: { config: [ { subnet: 10.10.20.0/24 } ] }
+  ot_net:
+    driver: bridge
+    ipam: { config: [ { subnet: 10.10.30.0/24 } ] }
